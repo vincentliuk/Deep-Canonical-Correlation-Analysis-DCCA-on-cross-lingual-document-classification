@@ -1,0 +1,391 @@
+#pragma once
+
+#include <iostream>
+
+#include "WhitenTransform.h"
+#include "DBN.h"
+#include "CCA.h"
+#include "Matrix.h"
+#include "HyperParams.h"
+
+using namespace std;
+
+class DeepCCAModel {
+public:
+	typedef DCCAHyperParams HyperParamType;
+
+private:
+	DCCAHyperParams _hyperParams;
+	vector<WhitenTransform> _whiten;
+	vector<DBN> _dbn;
+	AllocatingVector _params; //kl: stores the parameters for dbns of two views
+	CCA _cca;
+
+	MutableVector GetParams(int which) {
+		assert (which * which == which);
+
+		int numParams0 = _dbn[0].NumParams();
+		return (which == 0) ? _params.SubVector(0, numParams0) : _params.SubVector(numParams0, -1); //kl: -1 = end
+	}
+	
+	class BackpropFunction : public DifferentiableFunction {
+		CCA::TraceNormObjective _traceNormObjective; //kl: inner class TraceNormObjective in CCA class
+		DBN & _dbn1, & _dbn2;
+		const Matrix _input1, _input2;
+		AllocatingMatrix _tempInput1, _tempInput2;
+		int _numLayers1, _numLayers2;
+		double _alpha;
+
+        // kl: this PrivateEval method will be called in the constructor function initialization of OptimizerState, which is build in opt.Minimize()(check the Train method at bottom), the return is the total correlation.
+		double PrivateEval(const Vector & params, MutableVector & gradient, const Matrix & inputMiniBatch1, const Matrix & inputMiniBatch2) {
+			int numParams1 = _dbn1.NumParams(_numLayers1);
+			_dbn1.SetReadParams(params.SubVector(0, numParams1), _numLayers1);
+			_dbn2.SetReadParams(params.SubVector(numParams1, -1), _numLayers2);
+
+            //kl: mapup is used for calculating the output through dbn for input
+			Matrix mappedInput1 = _dbn1.MapUp(inputMiniBatch1, _numLayers1), mappedInput2 = _dbn2.MapUp(inputMiniBatch2, _numLayers2);
+
+			AllocatingMatrix & errors1 = _dbn1.GetTempMat();
+			AllocatingMatrix & errors2 = _dbn2.GetTempMat();
+
+			if (_numLayers1 > 0) errors1.Resize(mappedInput1.NumR(), mappedInput1.NumC());
+			if (_numLayers2 > 0) errors2.Resize(mappedInput2.NumR(), mappedInput2.NumC());
+
+            //kl: val is something related to total correlation. _traceNormObjective.EvalTrace is the primary method for DCCA, calculating the equations (10)~(13) in the paper, and stores gradient error of equation(11) in errors1 and errors2 (because both errors1 and errors2 are inference(&), and then it can be changed and kept from the method)
+			double val = _traceNormObjective.EvalTrace(mappedInput1, mappedInput2, errors1, errors2);
+			if (!errors1.AllSafe() || !errors2.AllSafe()) {
+				cout << "unsafe value in errors." << endl;
+			}
+
+			int m = inputMiniBatch1.NumC();
+			val /= m;
+
+			if (gradient.Len() > 0) {
+				gradient.Clear();
+				_dbn1.SetWriteParams(gradient.SubVector(0, numParams1), _numLayers1);
+				_dbn2.SetWriteParams(gradient.SubVector(numParams1, -1), _numLayers2);
+				_dbn1.BackProp(inputMiniBatch1, errors1, _numLayers1); // kl: get the backprop training for each DBN with gradient updating the weight in dbn. backprop with errors1 which has the DCCA top gradient from equation(11).
+				_dbn2.BackProp(inputMiniBatch2, errors2, _numLayers2);				
+				gradient /= m;
+			} else {
+				_dbn1.ClearWriteParams();
+				_dbn2.ClearWriteParams();
+			}
+
+			// regularize
+			double alphaEff = _alpha * m / NumIns();
+			val += _dbn1.Regularize(alphaEff, _numLayers1);
+			val += _dbn2.Regularize(alphaEff, _numLayers2);
+
+			return val + 1;
+		}
+		
+		MutableVector _emptyVector;
+
+	public: //kl: inner class BackpropFunction constructor function
+		BackpropFunction(const Matrix & input1, const Matrix & input2, DBN & dbn1, DBN & dbn2, const vector<double> & lambda, double alpha)
+			:
+		_traceNormObjective(lambda),// assign values at construct function
+		_dbn1(dbn1), _dbn2(dbn2), _input1(input1), _input2(input2),
+		_numLayers1(dbn1.NumLayers()), _numLayers2(dbn2.NumLayers()), _alpha(alpha)
+		{ }
+
+		void SetReadParams(const Vector & params) {
+			int numParams1 = _dbn1.NumParams(_numLayers1);
+			_dbn1.SetReadParams(params.SubVector(0, numParams1), _numLayers1);
+			_dbn2.SetReadParams(params.SubVector(numParams1, -1), _numLayers2);
+		}
+
+		int NumParams() { return _dbn1.NumParams(_numLayers1) + _dbn2.NumParams(_numLayers2); }
+
+		int NumIns() const { return _input1.NumC(); }
+		
+        
+        // Eval : evaluation, for updating the weights
+		double Eval(const Vector & params, MutableVector & gradient) {
+			return PrivateEval(params, gradient, _input1, _input2);
+		}
+		
+		double Eval(const Vector & params) {
+			return PrivateEval(params, _emptyVector, _input1, _input2);
+		}
+
+		double Eval(const Vector & params, MutableVector & gradient, const vector<int> & indices) {
+			int n = indices.size();
+
+			_tempInput1.Resize(_input1.NumR(), n);
+			_tempInput2.Resize(_input2.NumR(), n);
+
+			for (int i = 0; i < n; ++i) {
+				_tempInput1.GetCol(i).CopyFrom(_input1.GetCol(indices[i]));
+				_tempInput2.GetCol(i).CopyFrom(_input2.GetCol(indices[i]));
+			}
+			
+			return PrivateEval(params, gradient, _tempInput1, _tempInput2);
+		}
+
+		double Eval(const Vector & params, MutableVector & gradient, int start, int count) {
+			int numIns = NumIns();
+			if (count == -1) count = numIns;
+			start %= numIns;
+
+			Matrix input1, input2;
+			int end = start + count;
+			if (end <= NumIns()) {
+				input1 = _input1.SubMatrix(start, end);
+				input2 = _input2.SubMatrix(start, end);
+			} else {
+				_tempInput1.Resize(_input1.NumR(), count);
+				_tempInput1.SubMatrix(0, (NumIns() - start)).CopyFrom(_input1.SubMatrix(start, -1));
+				_tempInput1.SubMatrix(NumIns() - start, -1).CopyFrom(_input1.SubMatrix(0, end - NumIns()));
+				input1 = _tempInput1;
+
+				_tempInput2.Resize(_input2.NumR(), count);
+				_tempInput2.SubMatrix(0, (NumIns() - start)).CopyFrom(_input2.SubMatrix(start, -1));
+				_tempInput2.SubMatrix(NumIns() - start, -1).CopyFrom(_input2.SubMatrix(0, end - NumIns()));
+				input2 = _tempInput2;
+			}
+
+			return PrivateEval(params, gradient, input1, input2);
+		}
+	}; // kl: end of the inner class BackpropFunction definition, with " }; " for the ending.
+
+public:
+    // kl:construct function for class DeepCCAModel
+	DeepCCAModel() : _whiten(2), _dbn(2) { }
+	DeepCCAModel(DCCAHyperParams hyperParams) : _whiten(2), _dbn(2), _hyperParams(hyperParams) { }
+	
+    // kl: Deserialize is for read-out
+	void Deserialize(istream & inStream)
+	{
+		for (int i = 0; i < 2; ++i) {
+			_whiten[i].Deserialize(inStream);
+			_dbn[i].Deserialize(inStream);
+		}
+
+		_params.Deserialize(inStream);
+		_dbn[0].SetReadParams(GetParams(0));
+		_dbn[1].SetReadParams(GetParams(1));
+
+		_cca.Deserialize(inStream);
+	}
+    // Serialize is for read-in
+	void Serialize(ostream & outStream) const {
+		for (int i = 0; i < 2; ++i) {
+			_whiten[i].Serialize(outStream);
+			_dbn[i].Serialize(outStream);
+		}
+
+		_params.Serialize(outStream);
+
+		_cca.Serialize(outStream);
+	}
+    
+    //kl mod: for DCCA(X,[Y:Z]) in which X: view one(MFCC 273 features); Y: view two(XRMB 112 features)
+    void AlignLabel(const string & labelfile, AllocatingMatrix & tempMat, AllocatingMatrix & mat) const{
+                
+        //open label file and store data in "inStreamLabel"
+        if (labelfile.size() == 0) return;
+        
+        ifstream inStreamLabel(labelfile, ios::in|ios::binary);
+        if (!inStreamLabel.is_open()) {
+            cout << "Couldn't open label file " << labelfile.c_str() << endl;
+            exit(1);
+        }
+        
+        inStreamLabel.seekg(0, ios::end); // kl: seekg is used to move the position to the end of the file
+        int endPos = inStreamLabel.tellg(); // kl:tellg is used to get the position in the stream after it has been moved with seekg to the end of the stream, therefore determining the size of the file.
+        inStreamLabel.seekg(0, ios::beg); // kl: and then back to the beginning.
+        ASSERT(endPos / sizeof(double) % 1 == 0);
+        //int numC = (int)(endPos / sizeof(double) / 1);
+        
+        int numR = mat.NumR();
+        int numC = mat.NumC();
+        //kl: numC: trainSize
+        //if (maxCols != -1) numC = min(numC, maxCols);
+        
+        int labelFeatNum = 39;
+        mat.Resize(numR+labelFeatNum, numC);
+        double* temp = (double*) malloc(1*1 * sizeof(double));
+        
+        //cout <<"maxCol: "<< maxCols << " " <<"numR: "<< numR<<" " ;
+        
+        //inStreamTrain.read((char*)mat.Start()+0*(numR+labelFeatNum)*sizeof(double), numC*numR * sizeof(double));
+        for (int i=0;i<numC;i++){
+            
+            for (int j=0;j<numR;j++){
+                *(mat.Start()+i*(numR+labelFeatNum)+j) = *(tempMat.Start()+i*numR+j);
+            }
+            inStreamLabel.read((char*)temp, 1*sizeof(double));
+            // cout<<*temp<<" ";
+            for (int h=0;h<labelFeatNum;h++){
+                *(mat.Start()+i*(numR+labelFeatNum)+numR+h) = 0;
+            }
+            *(mat.Start()+i*(numR+labelFeatNum)+numR+(int)(*temp)) = 1;
+            
+        }
+        
+        numR = numR + 39;
+        /*double* pdata = mat.Start();
+        
+        //cout << maxCols << "\t" << numR << endl;
+         for(int i = 0; i < numC; i++) {
+            for (int j = 0; j < numR; j++)
+                cout << pdata[i * numR + j] << " ";
+             cout << endl;
+        }*/
+        
+        inStreamLabel.close();
+        
+    }
+
+	/*double Train(DCCAHyperParams hyperParams, const int numLayers[], const int inFeatSelect[], int outputSize, const vector<AllocatingMatrix> & trainData, TrainModifiers pretrainModifiers, TrainModifiers trainModifiers, Random & rand, const string & labelfile, bool labelTrain) {*/
+    //kl: without "labelfile" and "labelTrain" parameters in this train, not supervised training with labels
+    double Train(DCCAHyperParams hyperParams, const int numLayers[], const int inFeatSelect[], int outputSize, const vector<AllocatingMatrix> & trainData, TrainModifiers pretrainModifiers, TrainModifiers trainModifiers, Random & rand) {
+		_hyperParams = hyperParams;
+        cout<<"trainData1 NumC: "<<trainData[0].NumC()<<"\t"<<"trainData1 NumR: "<< trainData[0].NumR()<<"\t";
+        cout<<"trainData2 NumC: "<<trainData[1].NumC()<<"\t"<<"trainData2 NumR: "<< trainData[1].NumR()<<"\t";
+		vector<AllocatingMatrix> whitenedTrainData(2);
+		for (int v = 0; v < 2; ++v) {
+            //kl: NLP application without whitenning
+			//_whiten[v].Init(trainData[v], inFeatSelect[v]);
+            /*if(v==1){
+                cout<<"whiteInit NumC: "<<trainData[v].NumC()<<"\t"<<"whiteInit NumR: "<< trainData[v].NumR()<<"\t";
+            }*/
+			//_whiten[v].Transform(trainData[v], whitenedTrainData[v]);
+             //cout<<"whitened NumC: "<<whitenedTrainData[v].NumC()<<"\t"<<"whitened NumR: "<< whitenedTrainData[v].NumR()<<"\t";
+            /*if (v==1){
+                //kl: display the _whiten data and the _whiten data after adding the label features
+                double* pdata = whitenedTrainData[v].Start();
+                
+                
+                for(int i = 0; i < whitenedTrainData[v].NumC(); i++) {
+                    for (int j = 0; j < whitenedTrainData[v].NumR(); j++)
+                        cout << pdata[i * whitenedTrainData[v].NumR() + j] << " ";
+                    cout << endl;
+                } 
+                
+                
+                //AllocatingMatrix tempTrainData = whitenedTrainData[v];
+                //AlignLabel(labelfile, tempTrainData, whitenedTrainData[v]);
+                
+                //kl: display after adding the label features
+                double* pdata2 = whitenedTrainData[v].Start();
+            
+                for(int i = 0; i < whitenedTrainData[v].NumC(); i++) {
+                   for (int j = 0; j < whitenedTrainData[v].NumR(); j++)
+                       cout << pdata2[i * whitenedTrainData[v].NumR() + j] << " ";
+                   cout << endl;
+                }
+
+            } */
+            
+           
+            
+			int hSize = _hyperParams.params[v].GetLayerWidthH();
+            //kl: Initialize the basic parameters
+			//_dbn[v].Initialize(numLayers[v], whitenedTrainData[v].NumR(), hSize, outputSize);
+            //kl: without whitenning.
+            _dbn[v].Initialize(numLayers[v], trainData[v].NumR(), hSize, outputSize);
+            
+		}
+        cout<<"getting here"<<endl;
+		_params.Resize(_dbn[0].NumParams() + _dbn[1].NumParams());
+
+        // kl: start to use AutoEncoder for pretraining two views here
+		for (int v = 0; v < 2; ++v) {
+			//_dbn[v].Pretrain(whitenedTrainData[v], GetParams(v), rand, false, _hyperParams.params[v], pretrainModifiers);
+            //kl: without whitenning
+            _dbn[v].Pretrain(trainData[v], GetParams(v), rand, false, _hyperParams.params[v], pretrainModifiers);
+		}
+        
+        //kl: if just do AutoEncoder, comment out the code below which is for the DCCA unsupervised training
+		/*vector<double> lambda(2);
+		lambda[0] = _hyperParams.ccaReg1, lambda[1] = _hyperParams.ccaReg2; //kl: regularizer
+        
+        // mo and kl: modify "BackproFunction" for label fine-tuning from here
+        
+        //kl: BackpropFunction is the inner class of class DeepCCAModel
+		//BackpropFunction backpropFunc(whitenedTrainData[0], whitenedTrainData[1], _dbn[0], _dbn[1], lambda, _hyperParams.backpropReg);
+        //kl: without whitenning
+        BackpropFunction backpropFunc(trainData[0], trainData[1], _dbn[0], _dbn[1], lambda, _hyperParams.backpropReg);
+
+		LBFGS opt(false);
+		opt.Minimize(backpropFunc, _params, _params, trainModifiers.LBFGS_tol, trainModifiers.LBFGS_M, trainModifiers.testGrad); // kl: here begin to do the backpropagation CCA to two views' DBN, see deep into the OptimizerState constructor function when doing opt.Minimize.
+
+        //kl: seems from here, the parameters have been updated by the backpropgation, and read new-trained _params into the dbn
+		backpropFunc.SetReadParams(_params); */
+
+		Matrix mappedData[2];
+
+        //kl: map the input data to the dbn, and generate the new-updated output. 
+		//mappedData[0] = _dbn[0].MapUp(whitenedTrainData[0]);
+		//mappedData[1] = _dbn[1].MapUp(whitenedTrainData[1]);
+        //kl: without whitenning
+        mappedData[0] = _dbn[0].MapUp(trainData[0]);
+        mappedData[1] = _dbn[1].MapUp(trainData[1]);
+
+        //kl: calculate the CCA among the two new outputs from the two views.
+		//return _cca.InitWeights(mappedData, _hyperParams.ccaReg1, _hyperParams.ccaReg2);
+        //kl: just AutoEndoder without CCA, so comment out the sentence below 
+        //return _cca.InitWeights(mappedData, _hyperParams.ccaReg1, _hyperParams.ccaReg2);
+	}
+    
+	void MapUp(const Matrix & inData, AllocatingMatrix & outData, int which, const string & labelfile) const{
+		Matrix mappedData;
+
+		// using outData as a temp here
+		_whiten[which].Transform(inData, outData);
+        
+        //kl: map-up to the model with label data aligned
+        if (which==1){
+            AllocatingMatrix tempTrainData2 = outData;
+            AlignLabel(labelfile, tempTrainData2, outData);
+        }
+        
+		mappedData = _dbn[which].MapUp(outData);
+
+        //kl: generate the BNx here, put in "outData", BNx is the final output for other trainings, BNx is the new projection output imaged from input data.
+		_cca.Map(mappedData, which, outData);
+	}
+    
+    //kl: original mapup without labels
+    void MapUp(const AllocatingMatrix & inData, AllocatingMatrix & outData, int which) const{
+		Matrix mappedData;
+        
+		// using outData as a temp here
+		_whiten[which].Transform(inData, outData);
+        
+		mappedData = _dbn[which].MapUp(outData);
+        cout<<"get here"<<endl;
+        //kl: generate the BNx here, put in "outData", BNx is the final output for other trainings, BNx is the new projection output imaged from input data.
+		_cca.Map(mappedData, which, outData);
+	}
+    
+    // kl: this Mapup is only for generating the mapup result just after AutoEncoder, without CCA output
+    void MapUpAE(const Matrix & inData, AllocatingMatrix & outData, int which) const{
+		Matrix mappedData;
+        
+        // without whitenning
+		// using outData as a temp here
+		//_whiten[0].Transform(inData, outData);
+        
+		outData = _dbn[which].MapUp(inData);
+	}
+    
+    //kl: this mapup is for the NLP documents classification task
+    void MapUpNLP(const AllocatingMatrix & inData, AllocatingMatrix & outData, int which) const{
+		Matrix mappedData;
+     
+        //kl: without whitenning
+        
+		mappedData = _dbn[which].MapUp(inData);
+        
+        //kl: generate the BNx here, put in "outData", BNx is the final output for other trainings, BNx is the new projection output imaged from input data.
+		_cca.MapForDoc(mappedData, which, outData);
+	}
+
+	int InputSize(int view) const {
+		return _whiten[view].InSize();
+	}
+};

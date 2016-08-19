@@ -1,0 +1,26 @@
+/*
+	Example argument file for training a DCCA model
+*/
+
+inParams=data/params.bin
+outModel=data/model.bin
+
+numLayers1=4
+numLayers2=4
+outputSize=39
+
+iSize1=273
+iSize2=112
+
+inData1=data/DATA/JW11/MFCC[JW11,numfr1=7,numfr2=7,fold0,training].dat
+inData2=data/DATA/JW11/XRMB[JW11,numfr1=7,numfr2=7,fold0,training].dat
+
+
+outData1=data/trainOut1.dat
+outData2=data/trainOut2.dat
+
+hSize1=1000
+hSize2=700
+
+// uncomment to train on a prefix of the data
+// trainSize=1000

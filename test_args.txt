@@ -1,0 +1,7 @@
+inModel=data/model.bin
+
+inData1=data/DATA/JW11/MFCC[JW11,numfr1=7,numfr2=7,fold0,testing].dat
+inData2=data/DATA/JW11/XRMB[JW11,numfr1=7,numfr2=7,fold0,testing].dat
+
+outData1=testOut1.dat
+outData2=testOut2.dat

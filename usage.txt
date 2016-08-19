@@ -1,0 +1,65 @@
+This code can be used for training, storing/loading, and applying DCCA models, as described in the article "Deep Canonical Correlation Analysis", ICML, 2013.
+
+@inproceedings{andrew13deep,
+  title={Deep Canonical Correlation Analysis},
+  author={Andrew, Galen and Arora, Raman and Bilmes, Jeff and Livescu, Karen},
+  booktitle={ICML},
+  year={2011}
+}
+
+The code relies on Boost libraries (headers only) and the Intel Math Kernel Library. It has been built successfully with g++ for Linux and with Visual Studio for Windows.
+
+Arguments are specified on the command line with <name>=<value>. They can also
+   be read one per line from a file, allowing c-style comments.
+args         (string)   path to text file containing additional arguments
+inParams     (string)   path to binary file containing hyperparameter values
+outputSize   (int)      dimensionality of output representations
+numLayers1   (int)      number of layers in network for view 1
+numLayers2   (int)      number of layers in network for view 2
+hSize1       (int)      number of units per hidden layer for view 1
+hSize2       (int)      number of units per hidden layer for view 2
+inModel      (string)   path to previously stored DCCA model to read in
+outModel     (string)   path in which to store trained DCCA model
+inData1   (string)   path to matrix of training data for view 1
+inData2   (string)   path to matrix of training data for view 2
+outData1  (string)   path in which to store mapped data for view 1
+outData2  (string)   path in which to store mapped data for view 2
+iSize1       (int)      dimensionality of input data for view 1
+iSize2       (int)      dimensionality of input data for view 2
+iFeatSel1    (int)      reduced input dim of view 1 after PCA whitening
+iFeatSel2    (int)      reduced input dim of view 2 after PCA whitening
+trainSize    (int)      if specified, read only first n columns of all input
+
+Two example argument files are given, in train_args.txt and test_args.txt. The first trains a DCCA model, outputs the computed feature representation of the training set, and stores the model. The second reads the stored model and outputs the computed feature representation of the test set.
+
+The format of input and output data matrices is a simple binary file with all of the NxM values in double precision, where each data instance is contiguous. The dimensionality of the input must be given on the command line via "iSize1" and "iSize2".
+
+The hyperparameter value file consists of 15 double precision values (for DCCA), in this order:
+
+1. pretrainL2i-1: L2 regularization parameter for input layer pretraining (\lambda_a) (view 1)
+2. pretrainL2h-1: L2 regularization parameter for hidden layer pretraining (\lambda_a) (view 1)
+3. pretrainL2o-1: L2 regularization parameter for output layer pretraining (\lambda_a) (view 1)
+4. gaussianStdDevI-1: sigma for Gaussian noise in denoising autoencoder pretraining of input layer (\sigma_a) (view 1)
+5. gaussianStdDevH-1: sigma for Gaussian noise in denoising autoencoder pretraining of hidden layers (\sigma_a) (view 1)
+6. layerWidthH-1: width of all hidden layers (rounded down if non-integer) (view 1)
+7. pretrainL2i-2: L2 regularization parameter for input layer pretraining (\lambda_a) (view 2)
+8. pretrainL2h-2: L2 regularization parameter for hidden layer pretraining (\lambda_a) (view 2)
+9. pretrainL2o-2: L2 regularization parameter for output layer pretraining (\lambda_a) (view 2)
+10. gaussianStdDevI-2: sigma for Gaussian noise in denoising autoencoder pretraining of input layer (\sigma_a) (view 2)
+11. gaussianStdDevH-2: sigma for Gaussian noise in denoising autoencoder pretraining of hidden layers (\sigma_a) (view 2)
+12. layerWidthH-2: width of all hidden layers (rounded down if non-integer) (view 2)
+13. backpropReg: L2 regularization for backprop (fine-tuning) phase (\lambda_b)
+14. ccaReg1: CCA regularization parameter for view 1 (r_1 * (m-1))
+15. ccaReg2: CCA regularization parameter for view 2 (r_2 * (m-1))
+
+An example hyperparameter value file is given, called params.bin. This is used in train_args.txt, and is in fact the hyperparameters used for the XRMB dataset for the results reported in the paper.
+
+Note the CCA regularization parameter is slightly different than in the paper: instead of
+
+\Sigma_11 = 1/(m-1) H_1 H_1' + r_1 I
+
+the code implements
+
+\Sigma_11 = 1/(m-1) (H_1 H_1' + r_1 I)
+
+which may be more stable over a range of dataset sizes m.
